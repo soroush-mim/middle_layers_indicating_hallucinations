@@ -17,7 +17,8 @@ from tqdm import tqdm
 from transformers.generation.logits_process import LogitsProcessorList
 
 # modify attention
-from modify_attention import llama_head_guide
+from modify_attention import llama_foreground_guide, llama_head_guide
+from foreground_masks import COCOForegroundMasker
 
 from utils import setup_seeds, disable_torch_init
 
@@ -43,8 +44,25 @@ parser.add_argument("--beam", type=int, default=1) # Greedy decoding
 parser.add_argument("--sample", action="store_true")
 parser.add_argument("--alpha", type=float, default=0.5)
 parser.add_argument("--use-head-guide", action="store_true")
+parser.add_argument(
+    "--use-foreground-guide",
+    action="store_true",
+    help="Oracle foreground attention guidance from COCO instance segmentations.",
+)
 parser.add_argument("--aggregation", type=str, default="mean")
 parser.add_argument("--guide-range", type=str, default="5,18")
+parser.add_argument(
+    "--instances-path",
+    type=str,
+    default=None,
+    help="Path to instances_val2014.json; required by --use-foreground-guide.",
+)
+parser.add_argument(
+    "--foreground-alpha",
+    type=float,
+    default=None,
+    help="Foreground boost strength (defaults to --alpha).",
+)
 parser.add_argument("--max-tokens", type=int, default=512)
 parser.add_argument("--num-images", type=int, default=500)
 args = parser.parse_known_args()[0]
@@ -56,7 +74,16 @@ disable_torch_init() # accelerate the training process
 assert(args.batch_size == 1)
 
 print(f'Evaluated model: {args.model}')
+if args.use_head_guide and args.use_foreground_guide:
+    raise ValueError("Choose one intervention: --use-head-guide or --use-foreground-guide")
+if args.use_foreground_guide and not args.instances_path:
+    raise ValueError("--instances-path is required by --use-foreground-guide")
 model_manager = ModelManager(args.model)
+foreground_masker = (
+    COCOForegroundMasker(args.instances_path, model_manager.image_processor)
+    if args.use_foreground_guide
+    else None
+)
 
 base_dir = "./log/" + args.model
 if not os.path.exists(base_dir):
@@ -78,7 +105,10 @@ file_parts = [
     f"chair_eval_{args.num_images}images",
     f"_{args.aggregation}" if args.use_head_guide else "",
     f"_head_guided_alpha{args.alpha}" if args.use_head_guide else "",
-    f"_layers_{guided_layer_range[0]}-{guided_layer_range[1]}" if args.use_head_guide else "",
+    f"_foreground_guided_alpha{args.foreground_alpha if args.foreground_alpha is not None else args.alpha}"
+    if args.use_foreground_guide else "",
+    f"_layers_{guided_layer_range[0]}-{guided_layer_range[1]}"
+    if (args.use_head_guide or args.use_foreground_guide) else "",
     f"_tokens_{args.max_tokens}",
     "_sample" if args.sample else "",
     f"_beams_{args.beam}" if args.beam != 1 else "",
@@ -105,6 +135,15 @@ for batch_id, data in tqdm(enumerate(coco_loader), total=len(coco_loader)):
             alpha=args.alpha,
             img_start_idx=model_manager.img_start_idx,
             img_end_idx=model_manager.img_end_idx
+        )
+    elif args.use_foreground_guide:
+        llama_foreground_guide(
+            model=model_manager.llm_model,
+            guided_layer_range=guided_layer_range,
+            foreground_mask=foreground_masker.token_mask(int(img_id[0])),
+            alpha=args.foreground_alpha if args.foreground_alpha is not None else args.alpha,
+            img_start_idx=model_manager.img_start_idx,
+            img_end_idx=model_manager.img_end_idx,
         )
 
     with torch.inference_mode():

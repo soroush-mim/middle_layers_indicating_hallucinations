@@ -78,6 +78,27 @@ Then, evaluate CHAIR metrics, run
 python chair.py --cap_file ./log/[model]/[file_name].jsonl
 ```
 
+### Foreground-guided attention (COCO segmentation oracle)
+For an oracle experiment, the repository also supports boosting only CLIP
+image patches that overlap a COCO instance segmentation. The instance masks
+are unioned, resized and centre-cropped with the same CLIP preprocessing as
+the image, then area-pooled to LLaVA-1.5's row-major 24×24 (=576) image-token
+grid. This replaces (rather than combines with) heads-guided attention:
+
+```bash
+python chair_eval.py \
+  --model llava-1.5 \
+  --data-path /path/to/COCO/val2014 \
+  --instances-path /path/to/COCO/annotations/instances_val2014.json \
+  --use-foreground-guide --guide-range 5,18 --foreground-alpha 0.5
+```
+
+Install the added dependency first with `pip install -r requirements.txt`.
+Evaluate the resulting `foreground_guided` JSONL using the same `chair.py`
+command above. Because segmentation ground truth is supplied at inference,
+this is an *oracle upper-bound experiment*, not a deployable hallucination
+mitigation result; do not compare it as if it used only the input image.
+
 ## Citation
 Please cite our paper if it's helpful to your work!
 ```

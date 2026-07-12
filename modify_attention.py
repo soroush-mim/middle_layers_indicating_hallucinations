@@ -74,7 +74,8 @@ def llama_new_forward(
             attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min)
         )
 
-    ### vision attention modification
+    # Vision-attention modifications are applied to the pre-softmax logits of
+    # the newest token only.  This is the same location used by the paper.
     if hasattr(self, "aggregation"):
         img_start_idx = self.img_start_idx
         img_end_idx = self.img_end_idx
@@ -85,7 +86,25 @@ def llama_new_forward(
                 attn_weights[:, :, -1, img_start_idx:img_end_idx]
                 + self.alpha * attn_weights[:, :, -1, img_start_idx:img_end_idx].abs().mean(dim=1, keepdim=True)
             )
-    ### vision attention modification
+
+    if hasattr(self, "foreground_mask"):
+        img_start_idx = self.img_start_idx
+        img_end_idx = self.img_end_idx
+        visual_scores = attn_weights[:, :, -1, img_start_idx:img_end_idx]
+        mask = self.foreground_mask.to(device=visual_scores.device, dtype=visual_scores.dtype)
+        if mask.ndim == 1:
+            mask = mask.view(1, 1, -1)
+        if mask.shape[-1] != visual_scores.shape[-1]:
+            raise ValueError(
+                "foreground mask length must equal the number of image tokens "
+                f"({mask.shape[-1]} != {visual_scores.shape[-1]})"
+            )
+        # The scale is deliberately identical to Heads Guided Attention.  The
+        # only change is that COCO foreground occupancy gates the boost.
+        shared_score_scale = visual_scores.abs().mean(dim=1, keepdim=True)
+        attn_weights[:, :, -1, img_start_idx:img_end_idx] = (
+            visual_scores + self.foreground_alpha * shared_score_scale * mask
+        )
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
         query_states.dtype
@@ -119,3 +138,25 @@ def llama_head_guide(model, guided_layer_range, aggregation, alpha, img_start_id
         model.model.layers[i].self_attn.aggregation = aggregation
         model.model.layers[i].self_attn.alpha = alpha
         model.model.layers[i].self_attn.forward = types.MethodType(llama_new_forward, model.model.layers[i].self_attn)
+
+
+def llama_foreground_guide(
+    model, guided_layer_range, foreground_mask, alpha, img_start_idx, img_end_idx
+):
+    """Boost only visual patches covered by a foreground mask.
+
+    ``foreground_mask`` is a length-576, row-major 24x24 CLIP-patch mask with
+    values in [0, 1].  It is an oracle intervention when sourced from COCO GT.
+    """
+    layer_list = (
+        guided_layer_range
+        if len(guided_layer_range) == 1
+        else list(range(guided_layer_range[0], guided_layer_range[1]))
+    )
+    for i in layer_list:
+        attn = model.model.layers[i].self_attn
+        attn.img_start_idx = img_start_idx
+        attn.img_end_idx = img_end_idx
+        attn.foreground_mask = foreground_mask
+        attn.foreground_alpha = alpha
+        attn.forward = types.MethodType(llama_new_forward, attn)

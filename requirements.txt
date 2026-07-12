@@ -22,3 +22,4 @@ inflect==7.4.0
 opencv-python==4.10.0.84
 protobuf==5.29.2
 transformers-stream-generator==0.0.5
+pycocotools==2.0.8
