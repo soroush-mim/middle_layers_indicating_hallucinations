@@ -117,7 +117,7 @@ file_parts = [
 file_name = "".join(file_parts)
 
 # Generate captions for each image
-for batch_id, data in tqdm(enumerate(coco_loader), total=len(coco_loader)):
+for batch_id, data in tqdm(enumerate(coco_loader), total=min(args.num_images, len(coco_loader))):
     if batch_id == args.num_images: # Randomly select images for CHAIR evaluation
         break
     img_id = data["img_id"]
