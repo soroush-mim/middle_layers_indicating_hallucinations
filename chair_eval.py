@@ -61,7 +61,16 @@ parser.add_argument(
     "--foreground-alpha",
     type=float,
     default=None,
-    help="Foreground boost strength (defaults to --alpha).",
+    help="Extra boost on foreground patches (defaults to --alpha).",
+)
+parser.add_argument(
+    "--foreground-base",
+    type=float,
+    default=0.0,
+    help="Baseline boost applied to ALL visual tokens (head-guide enrichment). "
+    "Per-token boost is base + foreground_alpha * mask. 0.0 (default) = "
+    "foreground-only; set e.g. 0.5 to keep the context enrichment and add "
+    "foreground on top.",
 )
 parser.add_argument("--max-tokens", type=int, default=512)
 parser.add_argument("--num-images", type=int, default=500)
@@ -107,6 +116,8 @@ file_parts = [
     f"_head_guided_alpha{args.alpha}" if args.use_head_guide else "",
     f"_foreground_guided_alpha{args.foreground_alpha if args.foreground_alpha is not None else args.alpha}"
     if args.use_foreground_guide else "",
+    f"_base{args.foreground_base}"
+    if (args.use_foreground_guide and args.foreground_base != 0.0) else "",
     f"_layers_{guided_layer_range[0]}-{guided_layer_range[1]}"
     if (args.use_head_guide or args.use_foreground_guide) else "",
     f"_tokens_{args.max_tokens}",
@@ -142,6 +153,7 @@ for batch_id, data in tqdm(enumerate(coco_loader), total=min(args.num_images, le
             guided_layer_range=guided_layer_range,
             foreground_mask=foreground_masker.token_mask(int(img_id[0])),
             alpha=args.foreground_alpha if args.foreground_alpha is not None else args.alpha,
+            base=args.foreground_base,
             img_start_idx=model_manager.img_start_idx,
             img_end_idx=model_manager.img_end_idx,
         )

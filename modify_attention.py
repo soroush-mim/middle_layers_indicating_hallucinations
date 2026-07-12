@@ -100,10 +100,14 @@ def llama_new_forward(
                 f"({mask.shape[-1]} != {visual_scores.shape[-1]})"
             )
         # The scale is deliberately identical to Heads Guided Attention.  The
-        # only change is that COCO foreground occupancy gates the boost.
+        # per-token boost is ``base + alpha * mask``: ``base`` enriches every
+        # visual token (as head-guide does) and ``alpha`` adds extra weight on
+        # foreground patches.  base=0 recovers pure foreground-only guidance;
+        # alpha=0 recovers plain head-guide.
         shared_score_scale = visual_scores.abs().mean(dim=1, keepdim=True)
+        boost = self.foreground_base + self.foreground_alpha * mask
         attn_weights[:, :, -1, img_start_idx:img_end_idx] = (
-            visual_scores + self.foreground_alpha * shared_score_scale * mask
+            visual_scores + shared_score_scale * boost
         )
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
@@ -141,12 +145,16 @@ def llama_head_guide(model, guided_layer_range, aggregation, alpha, img_start_id
 
 
 def llama_foreground_guide(
-    model, guided_layer_range, foreground_mask, alpha, img_start_idx, img_end_idx
+    model, guided_layer_range, foreground_mask, alpha, img_start_idx, img_end_idx, base=0.0
 ):
-    """Boost only visual patches covered by a foreground mask.
+    """Boost visual patches with a ``base + alpha * mask`` per-token schedule.
 
     ``foreground_mask`` is a length-576, row-major 24x24 CLIP-patch mask with
     values in [0, 1].  It is an oracle intervention when sourced from COCO GT.
+
+    ``base`` is applied to every visual token (the head-guide enrichment) and
+    ``alpha`` adds the extra foreground weight.  ``base=0`` gives pure
+    foreground-only guidance; ``alpha=0`` reproduces plain head-guide.
     """
     layer_list = (
         guided_layer_range
@@ -159,4 +167,5 @@ def llama_foreground_guide(
         attn.img_end_idx = img_end_idx
         attn.foreground_mask = foreground_mask
         attn.foreground_alpha = alpha
+        attn.foreground_base = base
         attn.forward = types.MethodType(llama_new_forward, attn)
