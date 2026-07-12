@@ -7,3 +7,6 @@ venv/
 .env
 .ipynb_checkpoints/
 foreground_overlays/
+log/*
+log/llava-1.5/*
+log/*/*/
