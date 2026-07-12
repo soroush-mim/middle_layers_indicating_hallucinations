@@ -44,16 +44,36 @@ class COCOForegroundMasker:
     def _decode_union(self, image_id):
         height, width = self.image_sizes[image_id]
         union = torch.zeros((height, width), dtype=torch.bool)
+
         for annotation in self.annotations[image_id]:
             segmentation = annotation["segmentation"]
+
             if isinstance(segmentation, dict):
-                decoded = self.coco_mask.decode(segmentation)
+                # Uncompressed RLE
+                if isinstance(segmentation["counts"], list):
+                    rle = self.coco_mask.frPyObjects(
+                        segmentation,
+                        height,
+                        width,
+                    )
+                else:
+                    # Already compressed RLE
+                    rle = segmentation
             else:
-                rles = self.coco_mask.frPyObjects(segmentation, height, width)
-                decoded = self.coco_mask.decode(rles)
+                # Polygon(s)
+                rle = self.coco_mask.frPyObjects(
+                    segmentation,
+                    height,
+                    width,
+                )
+
+            decoded = self.coco_mask.decode(rle)
+
             if decoded.ndim == 3:
                 decoded = decoded.any(axis=2)
-            union |= torch.from_numpy(decoded.astype("bool"))
+
+            union |= torch.from_numpy(decoded.astype(bool))
+
         return union.float()
 
     def token_mask(self, image_id):
