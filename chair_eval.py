@@ -72,6 +72,20 @@ parser.add_argument(
     "foreground-only; set e.g. 0.5 to keep the context enrichment and add "
     "foreground on top.",
 )
+parser.add_argument(
+    "--foreground-binary",
+    action="store_true",
+    help="Treat a visual token as fully foreground (1.0) if >=1 of its pixels "
+    "is foreground; otherwise use fractional per-patch occupancy.",
+)
+parser.add_argument(
+    "--foreground-normalize",
+    action="store_true",
+    help="Scale foreground_alpha by 1/coverage per image, where coverage is the "
+    "fraction of visual tokens with non-zero foreground mask (e.g. 40%% "
+    "coverage -> alpha x2.5). Keeps the total foreground boost independent "
+    "of object size. Applies only to the alpha (mask) term, not --foreground-base.",
+)
 parser.add_argument("--max-tokens", type=int, default=512)
 parser.add_argument("--num-images", type=int, default=500)
 args = parser.parse_known_args()[0]
@@ -89,7 +103,11 @@ if args.use_foreground_guide and not args.instances_path:
     raise ValueError("--instances-path is required by --use-foreground-guide")
 model_manager = ModelManager(args.model)
 foreground_masker = (
-    COCOForegroundMasker(args.instances_path, model_manager.image_processor)
+    COCOForegroundMasker(
+        args.instances_path,
+        model_manager.image_processor,
+        binarize=args.foreground_binary,
+    )
     if args.use_foreground_guide
     else None
 )
@@ -118,6 +136,8 @@ file_parts = [
     if args.use_foreground_guide else "",
     f"_base{args.foreground_base}"
     if (args.use_foreground_guide and args.foreground_base != 0.0) else "",
+    "_binary" if (args.use_foreground_guide and args.foreground_binary) else "",
+    "_covnorm" if (args.use_foreground_guide and args.foreground_normalize) else "",
     f"_layers_{guided_layer_range[0]}-{guided_layer_range[1]}"
     if (args.use_head_guide or args.use_foreground_guide) else "",
     f"_tokens_{args.max_tokens}",
@@ -148,11 +168,19 @@ for batch_id, data in tqdm(enumerate(coco_loader), total=min(args.num_images, le
             img_end_idx=model_manager.img_end_idx
         )
     elif args.use_foreground_guide:
+        foreground_mask = foreground_masker.token_mask(int(img_id[0]))
+        foreground_alpha = (
+            args.foreground_alpha if args.foreground_alpha is not None else args.alpha
+        )
+        if args.foreground_normalize:
+            # coverage = fraction of visual tokens with any foreground.
+            coverage = (foreground_mask > 0).float().mean().item()
+            foreground_alpha = foreground_alpha / coverage if coverage > 0 else 0.0
         llama_foreground_guide(
             model=model_manager.llm_model,
             guided_layer_range=guided_layer_range,
-            foreground_mask=foreground_masker.token_mask(int(img_id[0])),
-            alpha=args.foreground_alpha if args.foreground_alpha is not None else args.alpha,
+            foreground_mask=foreground_mask,
+            alpha=foreground_alpha,
             base=args.foreground_base,
             img_start_idx=model_manager.img_start_idx,
             img_end_idx=model_manager.img_end_idx,

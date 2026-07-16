@@ -13,7 +13,7 @@ class COCOForegroundMasker:
     ``pycocotools`` is used so both polygons and RLE/crowd annotations work.
     """
 
-    def __init__(self, instances_path, image_processor, grid_size=24):
+    def __init__(self, instances_path, image_processor, grid_size=24, binarize=False):
         try:
             from pycocotools import mask as coco_mask
         except ImportError as exc:
@@ -33,6 +33,9 @@ class COCOForegroundMasker:
             for image in instances["images"]
         }
         self.grid_size = grid_size
+        # If True, a visual token is fully foreground (1.0) when >=1 of its
+        # pixels is foreground, and 0.0 only when every pixel is background.
+        self.binarize = binarize
         size = image_processor.size
         crop_size = image_processor.crop_size
         self.shortest_edge = size.get("shortest_edge", size.get("height"))
@@ -87,4 +90,9 @@ class COCOForegroundMasker:
         left = (resized_w - self.crop_width) // 2
         mask = mask[:, :, top : top + self.crop_height, left : left + self.crop_width]
         mask = F.interpolate(mask, size=(self.grid_size, self.grid_size), mode="area")
-        return mask.flatten().clamp_(0, 1)
+        mask = mask.flatten().clamp_(0, 1)
+        if self.binarize:
+            # Area pooling of a binary union is exactly the per-patch foreground
+            # fraction, so ``> 0`` means "at least one foreground pixel".
+            mask = (mask > 0).float()
+        return mask
