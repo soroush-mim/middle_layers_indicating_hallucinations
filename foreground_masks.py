@@ -32,6 +32,11 @@ class COCOForegroundMasker:
             image["id"]: (image["height"], image["width"])
             for image in instances["images"]
         }
+        # category_id -> COCO category name (e.g. 18 -> "dog"); used for
+        # per-object masks in the per-noun targeting experiments.
+        self.category_names = {
+            cat["id"]: cat["name"] for cat in instances.get("categories", [])
+        }
         self.grid_size = grid_size
         # If True, a visual token is fully foreground (1.0) when >=1 of its
         # pixels is foreground, and 0.0 only when every pixel is background.
@@ -44,45 +49,37 @@ class COCOForegroundMasker:
         if self.crop_height != self.crop_width:
             raise ValueError("This implementation expects a square CLIP crop.")
 
+    def _decode_annotation(self, annotation, height, width):
+        """Decode one COCO annotation to a full-resolution (H, W) bool array."""
+        segmentation = annotation["segmentation"]
+        if isinstance(segmentation, dict):
+            # Uncompressed RLE (counts is a list) vs already-compressed RLE.
+            if isinstance(segmentation["counts"], list):
+                rle = self.coco_mask.frPyObjects(segmentation, height, width)
+            else:
+                rle = segmentation
+        else:
+            # Polygon(s)
+            rle = self.coco_mask.frPyObjects(segmentation, height, width)
+        decoded = self.coco_mask.decode(rle)
+        if decoded.ndim == 3:
+            decoded = decoded.any(axis=2)
+        return decoded.astype(bool)
+
     def _decode_union(self, image_id):
         height, width = self.image_sizes[image_id]
         union = torch.zeros((height, width), dtype=torch.bool)
-
         for annotation in self.annotations[image_id]:
-            segmentation = annotation["segmentation"]
-
-            if isinstance(segmentation, dict):
-                # Uncompressed RLE
-                if isinstance(segmentation["counts"], list):
-                    rle = self.coco_mask.frPyObjects(
-                        segmentation,
-                        height,
-                        width,
-                    )
-                else:
-                    # Already compressed RLE
-                    rle = segmentation
-            else:
-                # Polygon(s)
-                rle = self.coco_mask.frPyObjects(
-                    segmentation,
-                    height,
-                    width,
-                )
-
-            decoded = self.coco_mask.decode(rle)
-
-            if decoded.ndim == 3:
-                decoded = decoded.any(axis=2)
-
-            union |= torch.from_numpy(decoded.astype(bool))
-
+            union |= torch.from_numpy(self._decode_annotation(annotation, height, width))
         return union.float()
 
-    def token_mask(self, image_id):
-        """Return foreground occupancy for the row-major 24x24 visual tokens."""
-        mask = self._decode_union(image_id).unsqueeze(0).unsqueeze(0)
-        height, width = self.image_sizes[image_id]
+    def _grid_from_fullres(self, fullres_mask, height, width):
+        """Project a full-resolution (H, W) float mask onto the token grid.
+
+        Follows CLIP preprocessing (resize shortest edge -> centre crop ->
+        area-pool to grid_size) so token i lines up with visual token i.
+        """
+        mask = fullres_mask.unsqueeze(0).unsqueeze(0)
         scale = self.shortest_edge / min(height, width)
         resized_h, resized_w = round(height * scale), round(width * scale)
         mask = F.interpolate(mask, size=(resized_h, resized_w), mode="nearest")
@@ -92,7 +89,38 @@ class COCOForegroundMasker:
         mask = F.interpolate(mask, size=(self.grid_size, self.grid_size), mode="area")
         mask = mask.flatten().clamp_(0, 1)
         if self.binarize:
-            # Area pooling of a binary union is exactly the per-patch foreground
+            # Area pooling of a binary mask is exactly the per-patch foreground
             # fraction, so ``> 0`` means "at least one foreground pixel".
             mask = (mask > 0).float()
         return mask
+
+    def token_mask(self, image_id):
+        """Return foreground occupancy for the row-major 24x24 visual tokens."""
+        height, width = self.image_sizes[image_id]
+        return self._grid_from_fullres(self._decode_union(image_id), height, width)
+
+    def category_token_masks(self, image_id, name_map=None):
+        """Return one token mask per object category present in the image.
+
+        ``name_map`` optionally maps a COCO category name to a different key
+        (e.g. CHAIR's canonical ``node_word``); categories mapping to the same
+        key are unioned at the token level. Returns ``{key: length-576 mask}``.
+        """
+        height, width = self.image_sizes[image_id]
+        fullres = {}
+        for annotation in self.annotations[image_id]:
+            name = self.category_names.get(annotation["category_id"])
+            if name is None:
+                continue
+            key = name_map.get(name, name) if name_map else name
+            decoded = torch.from_numpy(
+                self._decode_annotation(annotation, height, width)
+            )
+            if key in fullres:
+                fullres[key] |= decoded
+            else:
+                fullres[key] = decoded.clone()
+        return {
+            key: self._grid_from_fullres(mask.float(), height, width)
+            for key, mask in fullres.items()
+        }

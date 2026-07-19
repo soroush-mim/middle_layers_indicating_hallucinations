@@ -110,6 +110,25 @@ def llama_new_forward(
             visual_scores + shared_score_scale * boost
         )
 
+    if hasattr(self, "dynamic_holder"):
+        # Per-noun targeting (Version B): the active mask/base/alpha are read
+        # fresh from a shared, mutable holder every decode step, so a
+        # LogitsProcessor can switch which patches are emphasised as generation
+        # proceeds. holder.mask is a length-576 tensor (or None for no boost).
+        holder = self.dynamic_holder
+        if holder.mask is not None:
+            img_start_idx = self.img_start_idx
+            img_end_idx = self.img_end_idx
+            visual_scores = attn_weights[:, :, -1, img_start_idx:img_end_idx]
+            mask = holder.mask.to(device=visual_scores.device, dtype=visual_scores.dtype)
+            if mask.ndim == 1:
+                mask = mask.view(1, 1, -1)
+            shared_score_scale = visual_scores.abs().mean(dim=1, keepdim=True)
+            boost = holder.base + holder.alpha * mask
+            attn_weights[:, :, -1, img_start_idx:img_end_idx] = (
+                visual_scores + shared_score_scale * boost
+            )
+
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
         query_states.dtype
     )
@@ -169,3 +188,40 @@ def llama_foreground_guide(
         attn.foreground_alpha = alpha
         attn.foreground_base = base
         attn.forward = types.MethodType(llama_new_forward, attn)
+
+
+class DynamicMaskHolder:
+    """Mutable per-step attention control shared across all guided layers.
+
+    A LogitsProcessor mutates ``mask`` / ``base`` / ``alpha`` between decode
+    steps; every guided attention layer reads the current values on its next
+    forward. ``mask`` is a length-576 tensor, or None to apply no boost.
+    """
+
+    def __init__(self, mask=None, base=0.0, alpha=0.0):
+        self.mask = mask
+        self.base = base
+        self.alpha = alpha
+
+    def set(self, mask, base, alpha):
+        self.mask, self.base, self.alpha = mask, base, alpha
+
+
+def llama_dynamic_guide(model, guided_layer_range, holder, img_start_idx, img_end_idx):
+    """Install a shared ``DynamicMaskHolder`` on the guided attention layers.
+
+    Unlike the static guides, the mask/base/alpha are read from ``holder`` on
+    every forward, so per-noun targeting can change them across decode steps.
+    """
+    layer_list = (
+        guided_layer_range
+        if len(guided_layer_range) == 1
+        else list(range(guided_layer_range[0], guided_layer_range[1]))
+    )
+    for i in layer_list:
+        attn = model.model.layers[i].self_attn
+        attn.img_start_idx = img_start_idx
+        attn.img_end_idx = img_end_idx
+        attn.dynamic_holder = holder
+        attn.forward = types.MethodType(llama_new_forward, attn)
+    return holder

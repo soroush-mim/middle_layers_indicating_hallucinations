@@ -33,7 +33,19 @@ from chair import CHAIR
 
 
 def parse_variant(fname):
-    """Map a log filename to (family, base, alpha) for grouping/labelling."""
+    """Map a log filename to (family, base, label_val).
+
+    label_val is the value that varies along a family's curve (alpha for the
+    foreground sweeps, lock window W for the Version B lock runs) and is used
+    both to order points and to annotate them.
+    """
+    # Version B: per-noun lock runs, e.g. ..._locknoun_win4_keep_...
+    if "locknoun" in fname:
+        win = re.search(r"_win(\d+)", fname)
+        policy = re.search(r"_win\d+_([a-z]+)", fname)
+        return (f"Lock ({policy.group(1) if policy else '?'})", 0.0,
+                float(win.group(1)) if win else None)
+
     base = float(re.search(r"_base([0-9.]+)", fname).group(1)) if "_base" in fname else 0.0
     m_alpha = re.search(r"_alpha([0-9.]+)", fname)
     alpha = float(m_alpha.group(1)) if m_alpha else None
@@ -113,7 +125,8 @@ def main():
 
     # ---- table + csv ---------------------------------------------------------
     rows.sort(key=lambda r: (r["family"], r["alpha"] if r["alpha"] is not None else -1))
-    hdr = f"{'family':32} {'base':>4} {'alpha':>5} {'C_S':>6} {'C_I':>6} {'Rec':>6} {'Prec':>6} {'F1':>6} {'Len':>6}"
+    # 'a/W' = alpha for the foreground sweeps, lock window W for the lock runs.
+    hdr = f"{'family':32} {'base':>4} {'a/W':>5} {'C_S':>6} {'C_I':>6} {'Rec':>6} {'Prec':>6} {'F1':>6} {'Len':>6}"
     print("\n" + hdr)
     print("-" * len(hdr))
     for r in rows:

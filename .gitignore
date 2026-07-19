@@ -1,4 +1,5 @@
 __pycache__/
+__pycache__/*
 *.pyc
 *.pyo
 *.pyd
@@ -16,3 +17,5 @@ log/llava-1.5/*.jsonl
 log/llava-1.5/chair_eval_500images_foreground_guided_alpha0.5_layers_5-19_tokens_512.jsonl
 log/llava-1.5/chair_eval_500images_mean_head_guided_alpha0.5_layers_5-19_tokens_512.jsonl
 chair_plots/*
+__pycache__/foreground_masks.cpython-313.pyc
+__pycache__/modify_attention.cpython-313.pyc
