@@ -17,8 +17,13 @@ from tqdm import tqdm
 from transformers.generation.logits_process import LogitsProcessorList
 
 # modify attention
-from modify_attention import llama_foreground_guide, llama_head_guide
+from modify_attention import (
+    llama_foreground_guide,
+    llama_head_guide,
+    llama_segmentation_guide,
+)
 from foreground_masks import COCOForegroundMasker
+from seg_attention import SegAttentionConfig
 
 from utils import setup_seeds, disable_torch_init
 
@@ -86,6 +91,42 @@ parser.add_argument(
     "coverage -> alpha x2.5). Keeps the total foreground boost independent "
     "of object size. Applies only to the alpha (mask) term, not --foreground-base.",
 )
+# --- Segmentation-guided attention correction (Methods 1/2/3) ---------------
+parser.add_argument(
+    "--use-seg-correct",
+    action="store_true",
+    help="Enable the segmentation-guided correction pipeline (needs --instances-path). "
+    "With all three sub-methods off it reproduces head-guide exactly.",
+)
+# Method 1: scattered-attention repair
+parser.add_argument("--use-attention-repair", action="store_true")
+parser.add_argument("--repair-scatter-metric", default="entropy",
+                    choices=["entropy", "variance", "leakage", "components"])
+parser.add_argument("--repair-threshold", type=float, default=0.5)
+parser.add_argument("--repair-strategy", default="suppress",
+                    choices=["suppress", "redistribute", "blend"])
+parser.add_argument("--repair-gamma", type=float, default=1.0)
+parser.add_argument("--repair-blend-alpha", type=float, default=0.5)
+# Method 2: mask-guided head weighting
+parser.add_argument("--use-mask-weighted-average", action="store_true")
+parser.add_argument("--head-weight-metric", default="iou", choices=["iou", "dice", "cosine"])
+# Method 3: segmentation-guided alignment
+parser.add_argument("--use-attention-alignment", action="store_true")
+parser.add_argument("--align-metric", default="iou", choices=["iou", "dice", "kl"])
+parser.add_argument("--align-intervention", default="threshold",
+                    choices=["threshold", "scale", "topk"])
+parser.add_argument("--align-threshold", type=float, default=0.1)
+parser.add_argument("--align-topk", type=int, default=8)
+# shared
+parser.add_argument("--normalize-weights", default="linear", choices=["linear", "softmax"])
+parser.add_argument("--weight-temperature", type=float, default=1.0)
+parser.add_argument("--seg-binary", action="store_true", help="binarize the seg mask")
+parser.add_argument("--seg-alpha", type=float, default=None,
+                    help="correction strength for seg pipeline (defaults to --alpha)")
+# visualization
+parser.add_argument("--seg-viz-dir", default=None, help="if set, dump debug figures here")
+parser.add_argument("--seg-viz-layer", type=int, default=14)
+parser.add_argument("--seg-viz-steps", type=int, default=8)
 parser.add_argument("--max-tokens", type=int, default=512)
 parser.add_argument("--num-images", type=int, default=500)
 args = parser.parse_known_args()[0]
@@ -97,10 +138,11 @@ disable_torch_init() # accelerate the training process
 assert(args.batch_size == 1)
 
 print(f'Evaluated model: {args.model}')
-if args.use_head_guide and args.use_foreground_guide:
-    raise ValueError("Choose one intervention: --use-head-guide or --use-foreground-guide")
-if args.use_foreground_guide and not args.instances_path:
-    raise ValueError("--instances-path is required by --use-foreground-guide")
+_interventions = [args.use_head_guide, args.use_foreground_guide, args.use_seg_correct]
+if sum(bool(x) for x in _interventions) > 1:
+    raise ValueError("Choose one of --use-head-guide / --use-foreground-guide / --use-seg-correct")
+if (args.use_foreground_guide or args.use_seg_correct) and not args.instances_path:
+    raise ValueError("--instances-path is required by --use-foreground-guide / --use-seg-correct")
 model_manager = ModelManager(args.model)
 foreground_masker = (
     COCOForegroundMasker(
@@ -111,6 +153,39 @@ foreground_masker = (
     if args.use_foreground_guide
     else None
 )
+
+# Segmentation-guided correction: one masker + one config, reused per image.
+if args.use_seg_correct:
+    seg_masker = COCOForegroundMasker(
+        args.instances_path, model_manager.image_processor, binarize=args.seg_binary
+    )
+    seg_viz = None
+    if args.seg_viz_dir:
+        from seg_attention_viz import SegVizRecorder
+        seg_viz = SegVizRecorder(args.seg_viz_dir, layer=args.seg_viz_layer,
+                                 max_steps=args.seg_viz_steps)
+    seg_cfg = SegAttentionConfig(
+        use_repair=args.use_attention_repair,
+        repair_scatter_metric=args.repair_scatter_metric,
+        repair_threshold=args.repair_threshold,
+        repair_strategy=args.repair_strategy,
+        repair_gamma=args.repair_gamma,
+        repair_blend_alpha=args.repair_blend_alpha,
+        use_weighted_average=args.use_mask_weighted_average,
+        head_weight_metric=args.head_weight_metric,
+        use_alignment=args.use_attention_alignment,
+        align_metric=args.align_metric,
+        align_intervention=args.align_intervention,
+        align_threshold=args.align_threshold,
+        align_topk=args.align_topk,
+        normalize_weights=args.normalize_weights,
+        weight_temperature=args.weight_temperature,
+        binarize_mask=args.seg_binary,
+        viz=seg_viz,
+    )
+    seg_alpha = args.seg_alpha if args.seg_alpha is not None else args.alpha
+else:
+    seg_masker = None
 
 base_dir = "./log/" + args.model
 if not os.path.exists(base_dir):
@@ -127,6 +202,20 @@ coco_loader = torch.utils.data.DataLoader(
 guided_layer_range = [int(x) for x in args.guide_range.split(",")] # [start, end)
 guided_layer_range[1] += 1 # [start, end]
 
+# Build a compact tag describing the enabled seg-correction methods.
+seg_tag = ""
+if args.use_seg_correct:
+    parts = [f"_seg_alpha{seg_alpha}"]
+    if args.use_attention_repair:
+        parts.append(f"_m1repair-{args.repair_scatter_metric}-{args.repair_strategy}")
+    if args.use_mask_weighted_average:
+        parts.append(f"_m2wavg-{args.head_weight_metric}")
+    if args.use_attention_alignment:
+        parts.append(f"_m3align-{args.align_metric}-{args.align_intervention}")
+    if len(parts) == 1:
+        parts.append("_none")  # all methods off == head-guide baseline
+    seg_tag = "".join(parts)
+
 # Construct the output file name
 file_parts = [
     f"chair_eval_{args.num_images}images",
@@ -138,8 +227,9 @@ file_parts = [
     if (args.use_foreground_guide and args.foreground_base != 0.0) else "",
     "_binary" if (args.use_foreground_guide and args.foreground_binary) else "",
     "_covnorm" if (args.use_foreground_guide and args.foreground_normalize) else "",
+    seg_tag,
     f"_layers_{guided_layer_range[0]}-{guided_layer_range[1]}"
-    if (args.use_head_guide or args.use_foreground_guide) else "",
+    if (args.use_head_guide or args.use_foreground_guide or args.use_seg_correct) else "",
     f"_tokens_{args.max_tokens}",
     "_sample" if args.sample else "",
     f"_beams_{args.beam}" if args.beam != 1 else "",
@@ -182,6 +272,16 @@ for batch_id, data in tqdm(enumerate(coco_loader), total=min(args.num_images, le
             foreground_mask=foreground_mask,
             alpha=foreground_alpha,
             base=args.foreground_base,
+            img_start_idx=model_manager.img_start_idx,
+            img_end_idx=model_manager.img_end_idx,
+        )
+    elif args.use_seg_correct:
+        llama_segmentation_guide(
+            model=model_manager.llm_model,
+            guided_layer_range=guided_layer_range,
+            seg_mask=seg_masker.token_mask(int(img_id[0])),
+            cfg=seg_cfg,
+            alpha=seg_alpha,
             img_start_idx=model_manager.img_start_idx,
             img_end_idx=model_manager.img_end_idx,
         )

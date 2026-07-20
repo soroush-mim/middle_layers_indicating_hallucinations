@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
+from seg_attention import apply_seg_correction
+
 
 def llama_new_forward(
     self,
@@ -129,6 +131,20 @@ def llama_new_forward(
                 visual_scores + shared_score_scale * boost
             )
 
+    if hasattr(self, "seg_cfg"):
+        # Segmentation-guided attention correction (Methods 1/2/3). With every
+        # sub-method disabled this reduces to the head-guide correction
+        # (v + alpha * mean(|v|)), preserving baseline behaviour.
+        apply_seg_correction(
+            attn_weights,
+            self.img_start_idx,
+            self.img_end_idx,
+            self.seg_mask,
+            self.seg_cfg,
+            self.seg_alpha,
+            layer_idx=getattr(self, "layer_idx", None),
+        )
+
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
         query_states.dtype
     )
@@ -225,3 +241,27 @@ def llama_dynamic_guide(model, guided_layer_range, holder, img_start_idx, img_en
         attn.dynamic_holder = holder
         attn.forward = types.MethodType(llama_new_forward, attn)
     return holder
+
+
+def llama_segmentation_guide(
+    model, guided_layer_range, seg_mask, cfg, alpha, img_start_idx, img_end_idx
+):
+    """Install the segmentation-guided correction (Methods 1/2/3) on the layers.
+
+    ``seg_mask`` is a length-576 row-major token mask; ``cfg`` is a
+    ``SegAttentionConfig``. With all of cfg's methods disabled the correction is
+    identical to plain head-guide, so this doubles as the baseline path.
+    """
+    layer_list = (
+        guided_layer_range
+        if len(guided_layer_range) == 1
+        else list(range(guided_layer_range[0], guided_layer_range[1]))
+    )
+    for i in layer_list:
+        attn = model.model.layers[i].self_attn
+        attn.img_start_idx = img_start_idx
+        attn.img_end_idx = img_end_idx
+        attn.seg_mask = seg_mask
+        attn.seg_cfg = cfg
+        attn.seg_alpha = alpha
+        attn.forward = types.MethodType(llama_new_forward, attn)
